@@ -1,0 +1,209 @@
+<#
+.SYNOPSIS
+  Find Resource Groups across one or more subscriptions that have a particular tag (optionally with a specific value).
+
+.DESCRIPTION
+  Connects to Azure (interactive or service principal), enumerates subscriptions (either all accessible or a provided list),
+  and returns resource groups that contain the requested tag key. Optionally filters by tag value and exports results to CSV.
+
+.PARAMETER TagName
+  The tag key to filter resource groups by. (Required)
+
+.PARAMETER TagValue
+  Optional. If provided, only resource groups whose tag value matches (case-insensitive) will be returned.
+
+.PARAMETER SubscriptionIds
+  Optional array of subscription IDs to limit the search. If omitted, all subscriptions accessible to the account are checked.
+
+.PARAMETER OutputPath
+  Optional path to export results to CSV.
+
+.PARAMETER UseServicePrincipal
+  If set, the script will authenticate using the supplied client/secret/tenant.
+
+.PARAMETER TenantId
+  Tenant ID for service principal auth (required if UseServicePrincipal is used).
+
+.PARAMETER ClientId
+  Client (application) ID for service principal auth.
+
+.PARAMETER ClientSecret
+  Client secret for service principal auth.
+
+.EXAMPLE
+  # Interactive login, search all subscriptions for RGs with tag "environment"="prod" and save CSV
+  .\filter-rgs-by-tag.ps1 -TagName environment -TagValue prod -OutputPath .\prod-rgs.csv
+
+.EXAMPLE
+  # Using specific subscriptions, only filter by tag key (any value)
+  .\filter-rgs-by-tag.ps1 -TagName team -SubscriptionIds "1111-2222-3333","4444-5555-6666"
+
+.EXAMPLE
+  # Service principal auth
+  .\filter-rgs-by-tag.ps1 -TagName costCenter -UseServicePrincipal -TenantId "<tenant>" -ClientId "<appId>" -ClientSecret "<secret>"
+
+.NOTES
+  - Requires the Az PowerShell modules (Install-Module Az).
+  - Run in PowerShell 7+ or Windows PowerShell with Az modules installed.
+#>
+
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$TagName,
+
+    [Parameter(Mandatory=$false)]
+    [string]$TagValue,
+
+    [Parameter(Mandatory=$false)]
+    [string[]]$SubscriptionIds,
+
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$UseServicePrincipal,
+
+    [Parameter(Mandatory=$false)]
+    [string]$TenantId,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ClientId,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ClientSecret
+)
+
+function Ensure-AzModule {
+    if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+        Write-Error "Az PowerShell modules not found. Install them first: Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force"
+        exit 1
+    }
+}
+
+Ensure-AzModule
+
+# Authenticate
+if ($UseServicePrincipal.IsPresent) {
+    if (-not ($TenantId -and $ClientId -and $ClientSecret)) {
+        Write-Error "When using -UseServicePrincipal you must supply -TenantId, -ClientId and -ClientSecret."
+        exit 1
+    }
+
+    try {
+        $secureSecret = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+        Connect-AzAccount -ServicePrincipal -Tenant $TenantId -ApplicationId $ClientId -Credential $cred -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Error "Service principal login failed: $_"
+        exit 1
+    }
+} else {
+    try {
+        Connect-AzAccount -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Error "Interactive login failed: $_"
+        exit 1
+    }
+}
+
+# Resolve subscriptions
+try {
+    if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
+        $subscriptions = @()
+        foreach ($sid in $SubscriptionIds) {
+            try {
+                $sub = Get-AzSubscription -SubscriptionId $sid -ErrorAction Stop
+                $subscriptions += $sub
+            } catch {
+                Write-Warning "Subscription '$sid' could not be retrieved or you don't have access: $_"
+            }
+        }
+    } else {
+        $subscriptions = Get-AzSubscription -ErrorAction Stop
+    }
+} catch {
+    Write-Error "Failed to list subscriptions: $_"
+    exit 1
+}
+
+if (-not $subscriptions -or $subscriptions.Count -eq 0) {
+    Write-Warning "No subscriptions to scan."
+    exit 0
+}
+
+$results = New-Object System.Collections.Generic.List[object]
+
+foreach ($sub in $subscriptions) {
+    Write-Host "Scanning subscription: $($sub.Name) ($($sub.Id))" -ForegroundColor Cyan
+    try {
+        # Set context to target subscription
+        Set-AzContext -Subscription $sub.Id | Out-Null
+
+        # Get resource groups in the subscription
+        $rgs = Get-AzResourceGroup -ErrorAction Stop
+
+        foreach ($rg in $rgs) {
+            # Tags may be $null if no tags exist
+            if (-not $rg.Tags) { continue }
+
+            # Find tag by key (case-insensitive)
+            $tagEntry = $null
+            foreach ($kv in $rg.Tags.GetEnumerator()) {
+                if ($kv.Key -ieq $TagName) {
+                    $tagEntry = $kv
+                    break
+                }
+            }
+
+            if ($tagEntry) {
+                $valueMatches = $true
+                if ($PSBoundParameters.ContainsKey('TagValue')) {
+                    # Compare case-insensitive
+                    $valueMatches = $false
+                    if ($tagEntry.Value -ne $null -and $tagEntry.Value -ieq $TagValue) {
+                        $valueMatches = $true
+                    }
+                }
+
+                if ($valueMatches) {
+                    $tagString = ($rg.Tags.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'
+                    $obj = [PSCustomObject]@{
+                        SubscriptionId      = $sub.Id
+                        SubscriptionName    = $sub.Name
+                        ResourceGroupName   = $rg.ResourceGroupName
+                        Location            = $rg.Location
+                        TagKey              = $tagEntry.Key
+                        TagValueFound       = $tagEntry.Value
+                        AllTags             = $tagString
+                        ResourceGroupId     = $rg.ResourceId
+                    }
+                    $results.Add($obj) | Out-Null
+                }
+            }
+        }
+    } catch {
+        Write-Warning "Failed scanning subscription $($sub.Name): $_"
+    }
+}
+
+# Output results
+if ($results.Count -eq 0) {
+    Write-Host "No resource groups found with tag '$TagName'" -ForegroundColor Yellow
+} else {
+    Write-Host "`nFound $($results.Count) matching resource group(s):" -ForegroundColor Green
+    $results | Sort-Object SubscriptionName, ResourceGroupName | Format-Table -AutoSize
+
+    if ($OutputPath) {
+        try {
+            $dir = Split-Path -Path $OutputPath -Parent
+            if ($dir -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+            $results | Sort-Object SubscriptionName, ResourceGroupName | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+            Write-Host "Exported results to: $OutputPath" -ForegroundColor Green
+        } catch {
+            Write-Warning "Failed to export CSV: $_"
+        }
+    }
+}
+
+# Return results object for piping if the script is dot-sourced or used in a pipeline
+return $results
