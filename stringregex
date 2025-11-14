@@ -1,0 +1,21 @@
+
+$word = "PowerShell"
+$prefix = "Power"
+
+if ($word.StartsWith($prefix)) {
+    "Has prefix"
+} else {
+    "Does not have prefix"
+}
+
+
+$word = "filename.txt"
+$suffix = ".txt"
+
+if ($word.EndsWith($suffix)) {
+    "Has suffix"
+} else {
+    "Does not have suffix"
+}
+
+
